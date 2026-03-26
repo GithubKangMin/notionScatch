@@ -7,11 +7,19 @@ final class NotionSketchCoordinator: NSObject {
     private var statusItem: NSStatusItem?
     private var hotKeyRef: EventHotKeyRef?
     private var hotKeyHandlerRef: EventHandlerRef?
-    private var editorWindowController: ImageEditorWindowController?
     private var lastEditedImage: NSImage?
-    private weak var targetApplication: NSRunningApplication?
+    private var targetApplication: NSRunningApplication?
     private var isCaptureFlowActive = false
     private var lastCaptureTriggerDate = Date.distantPast
+
+    // File monitoring (polling)
+    private var markupTempURL: URL?
+    private var markupPollingTimer: Timer?
+    private var markupOriginalModDate: Date?
+    private var markupMonitorStartDate: Date?
+
+    // Mouse position for re-selecting image in Notion
+    private var capturedClickPosition: CGPoint?
 
     func start() {
         configureStatusItem()
@@ -99,10 +107,13 @@ final class NotionSketchCoordinator: NSObject {
 
         targetApplication = frontmostApp
 
+        // Save mouse position before copying — used to re-select the image block later
+        capturedClickPosition = NSEvent.mouseLocation
+
         Task { @MainActor in
             do {
                 let image = try await captureSelectedImage()
-                openEditor(with: image)
+                openInPreview(with: image)
             } catch {
                 isCaptureFlowActive = false
                 showAlert(title: "이미지 복사 실패", message: error.localizedDescription)
@@ -110,34 +121,211 @@ final class NotionSketchCoordinator: NSObject {
         }
     }
 
-    private func openEditor(with image: NSImage) {
-        let controller = ImageEditorWindowController(image: image) { [weak self] editedImage in
-            self?.replaceSelectedImageInNotion(with: editedImage)
+    private func openInPreview(with image: NSImage) {
+        guard let tempURL = saveTempImage(image) else {
+            isCaptureFlowActive = false
+            showAlert(title: "오류", message: "이미지를 임시 파일로 저장할 수 없습니다.")
+            return
         }
-        editorWindowController = controller
-        NSApp.activate(ignoringOtherApps: true)
-        controller.showWindow(nil)
-        controller.window?.makeKeyAndOrderFront(nil)
+
+        markupTempURL = tempURL
+        markupOriginalModDate = modificationDate(of: tempURL)
+        startMonitoringFile(at: tempURL)
+
+        // AppleScript: Finder에서 파일 선택 → Quick Look 열기 → Finder 창을 화면 밖으로
+        let path = tempURL.path
+        let script = NSAppleScript(source: """
+            tell application "Finder"
+                activate
+                reveal (POSIX file "\(path)" as alias)
+                select (POSIX file "\(path)" as alias)
+            end tell
+            delay 0.5
+            tell application "System Events"
+                tell process "Finder"
+                    keystroke space
+                end tell
+            end tell
+            delay 0.3
+            -- Finder 창을 화면 밖으로 이동 (닫으면 Quick Look도 닫힘)
+            tell application "Finder"
+                try
+                    set position of front window to {-3000, -3000}
+                end try
+            end tell
+        """)
+        var errorInfo: NSDictionary?
+        script?.executeAndReturnError(&errorInfo)
+        if let errorInfo {
+            showAlert(title: "Quick Look 열기 실패", message: "\(errorInfo)")
+        }
+    }
+
+    private func saveTempImage(_ image: NSImage) -> URL? {
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Desktop/notionScatch-temp", isDirectory: true)
+        // Clean old files
+        if FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.removeItem(at: dir)
+        }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let tempURL = dir.appendingPathComponent("편집중.png")
+        guard let tiffData = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiffData),
+              let pngData = rep.representation(using: .png, properties: [:]) else {
+            return nil
+        }
+        do {
+            try pngData.write(to: tempURL)
+            return tempURL
+        } catch {
+            return nil
+        }
+    }
+
+    private func modificationDate(of url: URL) -> Date? {
+        try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date
+    }
+
+    private func startMonitoringFile(at url: URL) {
+        markupPollingTimer?.invalidate()
+        // Quick Look이 파일을 열면서 수정일이 바뀔 수 있으므로 5초 후부터 감시 시작
+        markupMonitorStartDate = Date()
+        markupPollingTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                self.checkForFileChanges()
+            }
+        }
+    }
+
+    private func stopMonitoringFile() {
+        markupPollingTimer?.invalidate()
+        markupPollingTimer = nil
+    }
+
+    private func checkForFileChanges() {
+        guard let tempURL = markupTempURL else {
+            stopMonitoringFile()
+            return
+        }
+
+        // Quick Look이 열리는 동안은 무시 (최소 5초 대기)
+        if let startDate = markupMonitorStartDate,
+           Date().timeIntervalSince(startDate) < 5.0 {
+            // 매번 기준 시간을 갱신하여 Quick Look이 파일 속성을 바꿔도 무시
+            markupOriginalModDate = modificationDate(of: tempURL)
+            return
+        }
+
+        // 파일이 삭제되었으면 정리
+        guard FileManager.default.fileExists(atPath: tempURL.path) else {
+            cleanupMarkup()
+            return
+        }
+
+        let newModDate = modificationDate(of: tempURL)
+        guard newModDate != markupOriginalModDate else { return }
+
+        // 파일이 수정됨 — Quick Look에서 "완료" 누른 것
+        stopMonitoringFile()
+
+        // Quick Look 닫기 + Finder 정리
+        let closeScript = NSAppleScript(source: """
+            tell application "System Events"
+                tell process "Finder"
+                    keystroke space
+                end tell
+            end tell
+            delay 0.3
+            tell application "Finder"
+                try
+                    close every window
+                end try
+            end tell
+        """)
+        closeScript?.executeAndReturnError(nil)
+
+        if let data = try? Data(contentsOf: tempURL),
+           let image = NSImage(data: data) {
+            replaceSelectedImageInNotion(with: image)
+        }
+
+        // 정리: temp 폴더 삭제
+        try? FileManager.default.removeItem(at: tempURL.deletingLastPathComponent())
+        markupTempURL = nil
+        markupOriginalModDate = nil
+    }
+
+    private func cleanupMarkup() {
+        stopMonitoringFile()
+        if let url = markupTempURL {
+            try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+            markupTempURL = nil
+        }
+        markupOriginalModDate = nil
+        markupMonitorStartDate = nil
+        isCaptureFlowActive = false
     }
 
     private func replaceSelectedImageInNotion(with image: NSImage) {
-        writeImageToPasteboard(image)
         lastEditedImage = image
         isCaptureFlowActive = false
 
         guard let app = targetApplication else {
-            showAlert(title: "복귀 실패", message: "원래 Notion 앱 정보를 찾지 못했습니다.")
+            // Notion 앱을 찾지 못하면 클립보드에만 복사
+            writeImageToPasteboard(image)
+            showAlert(title: "클립보드에 복사됨", message: "Notion에서 원본 이미지를 선택 후 Delete → Cmd+V로 교체하세요.")
             return
         }
 
+        writeImageToPasteboard(image)
         app.activate(options: [.activateIgnoringOtherApps])
 
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 350_000_000)
-            sendKey(keyCode: 51) // Delete
-            try? await Task.sleep(nanoseconds: 120_000_000)
-            sendKey(keyCode: 9, modifiers: .maskCommand) // V
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+
+            // 이미지 블록 클릭하여 선택
+            if let screenPos = capturedClickPosition {
+                clickAtPosition(screenPos)
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+
+            // 이미지 선택 상태에서 위쪽 블록으로 이동
+            sendKey(keyCode: 126) // Up arrow
+            try? await Task.sleep(nanoseconds: 200_000_000)
+
+            // Enter로 이미지 바로 위에 새 빈 블록 생성
+            sendKey(keyCode: 36) // Enter
+            try? await Task.sleep(nanoseconds: 200_000_000)
+
+            // 새 빈 블록에 이미지 붙여넣기
+            sendKey(keyCode: 9, modifiers: .maskCommand) // Cmd+V
+            try? await Task.sleep(nanoseconds: 800_000_000)
+
+            // 아래의 원본 이미지로 이동하여 삭제
+            sendKey(keyCode: 125) // Down arrow
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            sendKey(keyCode: 51) // Backspace (원본 삭제)
         }
+    }
+
+    /// Posts a mouse click at a screen position (in Cocoa screen coordinates).
+    private func clickAtPosition(_ cocoaPoint: CGPoint) {
+        // Convert Cocoa screen coords (origin bottom-left) to CG coords (origin top-left)
+        // Use the main screen's full height for conversion (CG coordinate space)
+        let mainScreenHeight = NSScreen.screens.first?.frame.height ?? 0
+        let cgPoint = CGPoint(x: cocoaPoint.x, y: mainScreenHeight - cocoaPoint.y)
+
+        let source = CGEventSource(stateID: .hidSystemState)
+        // Move mouse first to ensure correct positioning
+        let mouseMove = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: cgPoint, mouseButton: .left)
+        mouseMove?.post(tap: .cghidEventTap)
+
+        let mouseDown = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: cgPoint, mouseButton: .left)
+        let mouseUp = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: cgPoint, mouseButton: .left)
+        mouseDown?.post(tap: .cghidEventTap)
+        mouseUp?.post(tap: .cghidEventTap)
     }
 
     @objc
@@ -165,7 +353,7 @@ final class NotionSketchCoordinator: NSObject {
             1. notionScatch를 실행해 둡니다.
             2. Notion 데스크톱 앱에서 바꾸고 싶은 이미지를 클릭해 선택합니다.
             3. Cmd+Shift+S를 누릅니다.
-            4. 필기 후 '확인 후 Notion 교체'를 누르면 기존 이미지 교체를 시도합니다.
+            4. Preview에서 편집(iPad 주석 가능) 후 Cmd+S로 저장하면 원래 자리로 교체를 시도합니다.
             """
         )
     }
