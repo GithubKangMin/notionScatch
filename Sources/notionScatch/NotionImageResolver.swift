@@ -11,17 +11,29 @@ enum NotionImageResolver {
     // MARK: - Main entry point
 
     static func resolve(clipboardHTML: String?, clipboardText: String?) async -> NSImage? {
+        await resolveWithDebug(clipboardHTML: clipboardHTML, clipboardText: clipboardText).0
+    }
+
+    static func resolveWithDebug(clipboardHTML: String?, clipboardText: String?) async -> (NSImage?, String) {
+        var log = ""
+
         guard let attachment = parseAttachmentSource(html: clipboardHTML, text: clipboardText) else {
-            return nil
+            log += "❌ attachment URL 파싱 실패 (HTML에 attachment:UUID:source 패턴 없음)\n"
+            return (nil, log)
         }
+        log += "✅ attachment 파싱 성공: fileId=\(attachment.fileId)\n"
 
         guard let block = findBlock(fileId: attachment.fileId, fallbackSource: attachment.source) else {
-            return nil
+            log += "❌ notion.db에서 블록을 찾지 못함\n"
+            return (nil, log)
         }
+        log += "✅ DB 블록 찾음: blockId=\(block.blockId)\n"
 
         guard let cookies = decryptCookies() else {
-            return nil
+            log += "❌ 쿠키 복호화 실패 (키체인 'Notion Safe Storage' 접근 불가)\n"
+            return (nil, log)
         }
+        log += "✅ 쿠키 복호화 성공\n"
 
         guard let signedURL = await fetchSignedURL(
             source: block.source,
@@ -29,10 +41,17 @@ enum NotionImageResolver {
             tokenV2: cookies.tokenV2,
             fileToken: cookies.fileToken
         ) else {
-            return nil
+            log += "❌ signed URL 가져오기 실패 (API 오류 또는 인증 실패)\n"
+            return (nil, log)
         }
+        log += "✅ signed URL 획득\n"
 
-        return await downloadImage(from: signedURL)
+        guard let image = await downloadImage(from: signedURL) else {
+            log += "❌ 이미지 다운로드 실패\n"
+            return (nil, log)
+        }
+        log += "✅ 이미지 다운로드 성공\n"
+        return (image, log)
     }
 
     // MARK: - Parse attachment from clipboard
@@ -261,5 +280,125 @@ enum NotionImageResolver {
             return nil
         }
         return NSImage(data: data)
+    }
+
+    // MARK: - API-based image replacement (캡션 보존)
+
+    struct CaptureContext {
+        let blockId: String
+        let spaceId: String
+        let tokenV2: String
+        let fileToken: String
+    }
+
+    static func buildCaptureContext(clipboardHTML: String?, clipboardText: String?) -> CaptureContext? {
+        guard let attachment = parseAttachmentSource(html: clipboardHTML, text: clipboardText),
+              let block = findBlock(fileId: attachment.fileId, fallbackSource: attachment.source),
+              let cookies = decryptCookies() else { return nil }
+        return CaptureContext(blockId: block.blockId, spaceId: block.spaceId,
+                             tokenV2: cookies.tokenV2, fileToken: cookies.fileToken)
+    }
+
+    /// 새 이미지를 S3에 업로드하고 블록 소스만 교체 (캡션 등 다른 속성 유지)
+    static func replaceBlockImage(context: CaptureContext, pngData: Data) async -> Bool {
+        nsLog("Step 1: getUploadFileUrl 요청 중...")
+        guard let upload = await requestUploadURL(context: context) else {
+            nsLog("Step 1 실패: getUploadFileUrl")
+            return false
+        }
+        nsLog("Step 1 성공: fileId=\(upload.fileId)")
+
+        nsLog("Step 2: S3 업로드 중... \(pngData.count) bytes")
+        guard await putToS3(url: upload.putURL, data: pngData) else {
+            nsLog("Step 2 실패: S3 PUT")
+            return false
+        }
+        nsLog("Step 2 성공: S3 업로드 완료")
+
+        nsLog("Step 3: submitTransaction 요청 중...")
+        let result = await submitSourceUpdate(context: context, newSource: upload.sourceURL, newFileId: upload.fileId)
+        nsLog("Step 3 \(result ? "성공" : "실패")")
+        return result
+    }
+
+    private static func requestUploadURL(context: CaptureContext) async -> (putURL: URL, sourceURL: String, fileId: String)? {
+        guard let endpoint = URL(string: "https://www.notion.so/api/v3/getUploadFileUrl") else { return nil }
+        var req = URLRequest(url: endpoint)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(cookieHeader(context), forHTTPHeaderField: "Cookie")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "bucket": "secure", "name": "edited.png", "contentType": "image/png",
+            "record": ["table": "block", "id": context.blockId, "spaceId": context.spaceId]
+        ] as [String: Any])
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req) else {
+            nsLog("getUploadFileUrl: 네트워크 오류")
+            return nil
+        }
+        let statusCode = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        if statusCode != 200 {
+            let body = String(data: data, encoding: .utf8) ?? ""
+            nsLog("getUploadFileUrl: HTTP \(statusCode) — \(body)")
+            return nil
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let putStr = json["signedPutUrl"] as? String, let putURL = URL(string: putStr),
+              let sourceURL = json["url"] as? String else {
+            let body = String(data: data, encoding: .utf8) ?? ""
+            nsLog("getUploadFileUrl: JSON 파싱 실패 — \(body)")
+            return nil
+        }
+
+        let comps = URL(string: sourceURL)?.pathComponents ?? []
+        let fileId = comps.count >= 3 ? comps[comps.count - 2] : UUID().uuidString
+        return (putURL, sourceURL, fileId)
+    }
+
+    private static func putToS3(url: URL, data: Data) async -> Bool {
+        var req = URLRequest(url: url)
+        req.httpMethod = "PUT"
+        req.setValue("image/png", forHTTPHeaderField: "Content-Type")
+        req.httpBody = data
+        guard let (_, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return false }
+        return true
+    }
+
+    private static func submitSourceUpdate(context: CaptureContext, newSource: String, newFileId: String) async -> Bool {
+        guard let endpoint = URL(string: "https://www.notion.so/api/v3/submitTransaction") else { return false }
+        var req = URLRequest(url: endpoint)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(cookieHeader(context), forHTTPHeaderField: "Cookie")
+
+        let pointer: [String: String] = ["table": "block", "id": context.blockId, "spaceId": context.spaceId]
+        let body: [String: Any] = [
+            "requestId": UUID().uuidString,
+            "transactions": [[
+                "id": UUID().uuidString,
+                "spaceId": context.spaceId,
+                "operations": [
+                    ["pointer": pointer, "path": ["properties", "source"], "command": "set", "args": [[newSource]]] as [String: Any]
+                ]
+            ] as [String: Any]]
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        guard let (data, resp) = try? await URLSession.shared.data(for: req) else {
+            nsLog("submitTransaction: 네트워크 오류")
+            return false
+        }
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        if code != 200 {
+            let body = String(data: data, encoding: .utf8) ?? ""
+            nsLog("submitTransaction: HTTP \(code) — \(body)")
+            return false
+        }
+        return true
+    }
+
+    private static func cookieHeader(_ ctx: CaptureContext) -> String {
+        "token_v2=\(ctx.tokenV2); file_token=\(ctx.fileToken)"
     }
 }

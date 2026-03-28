@@ -2,6 +2,21 @@ import AppKit
 import ApplicationServices
 import Carbon.HIToolbox
 
+func nsLog(_ msg: String) {
+    let ts = ISO8601DateFormatter().string(from: Date())
+    let line = "[\(ts)] \(msg)\n"
+    let logPath = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/notionScatch/debug.log")
+    try? FileManager.default.createDirectory(at: logPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+    if let fh = try? FileHandle(forWritingTo: logPath) {
+        fh.seekToEndOfFile()
+        fh.write(line.data(using: .utf8)!)
+        fh.closeFile()
+    } else {
+        try? line.data(using: .utf8)?.write(to: logPath)
+    }
+}
+
 @MainActor
 final class NotionSketchCoordinator: NSObject {
     private var statusItem: NSStatusItem?
@@ -20,6 +35,9 @@ final class NotionSketchCoordinator: NSObject {
 
     // Mouse position for re-selecting image in Notion
     private var capturedClickPosition: CGPoint?
+
+    // Notion block context for API-based replacement (preserves caption)
+    private var capturedContext: NotionImageResolver.CaptureContext?
 
     func start() {
         configureStatusItem()
@@ -132,38 +150,64 @@ final class NotionSketchCoordinator: NSObject {
         markupOriginalModDate = modificationDate(of: tempURL)
         startMonitoringFile(at: tempURL)
 
-        // AppleScript: Finder에서 파일 선택 → Quick Look 열기 → Finder 창을 화면 밖으로
+        // Finder Quick Look으로 열기 (iPad Continuity Markup 지원)
         let path = tempURL.path
-        let script = NSAppleScript(source: """
-            tell application "Finder"
-                activate
-                reveal (POSIX file "\(path)" as alias)
-                select (POSIX file "\(path)" as alias)
+
+        // Quick Look 위치 계산 (우측 상단)
+        let screen = NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let qlW = 700
+        let qlH = 550
+        let qlX = Int(screen.width) - qlW - 30
+        let qlY = 80
+
+        // osascript를 별도 프로세스로 실행 (앱 내 NSAppleScript는 자동화 권한 문제)
+        let scriptText = """
+        tell application "Finder"
+            close every window
+        end tell
+        delay 0.1
+        tell application "Finder"
+            activate
+            reveal (POSIX file "\(path)" as alias)
+            select (POSIX file "\(path)" as alias)
+        end tell
+        delay 0.1
+        tell application "Finder"
+            try
+                set bounds of front window to {-2000, 2000, -1900, 2100}
+            end try
+        end tell
+        delay 0.3
+        tell application "System Events"
+            tell process "Finder"
+                keystroke space
             end tell
-            delay 0.5
-            tell application "System Events"
-                tell process "Finder"
-                    keystroke space
-                end tell
-            end tell
-            delay 0.3
-            -- Finder 창을 화면 밖으로 이동 (닫으면 Quick Look도 닫힘)
-            tell application "Finder"
+        end tell
+        delay 0.5
+        tell application "System Events"
+            tell process "Finder"
                 try
-                    set position of front window to {-3000, -3000}
+                    set frontWindow to front window
+                    set position of frontWindow to {\(qlX), \(qlY)}
+                    set size of frontWindow to {\(qlW), \(qlH)}
                 end try
             end tell
-        """)
-        var errorInfo: NSDictionary?
-        script?.executeAndReturnError(&errorInfo)
-        if let errorInfo {
-            showAlert(title: "Quick Look 열기 실패", message: "\(errorInfo)")
+        end tell
+        """
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        proc.arguments = ["-e", scriptText]
+        do {
+            try proc.run()
+        } catch {
+            nsLog("osascript 실행 실패: \(error)")
         }
     }
 
     private func saveTempImage(_ image: NSImage) -> URL? {
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Desktop/notionScatch-temp", isDirectory: true)
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("notionScatch", isDirectory: true)
         // Clean old files
         if FileManager.default.fileExists(atPath: dir.path) {
             try? FileManager.default.removeItem(at: dir)
@@ -227,24 +271,10 @@ final class NotionSketchCoordinator: NSObject {
         let newModDate = modificationDate(of: tempURL)
         guard newModDate != markupOriginalModDate else { return }
 
-        // 파일이 수정됨 — Quick Look에서 "완료" 누른 것
+        // 파일이 수정됨
+        nsLog("파일 변경 감지: \(tempURL.lastPathComponent)")
+        nsLog("원본 수정일: \(String(describing: markupOriginalModDate)), 새 수정일: \(String(describing: newModDate))")
         stopMonitoringFile()
-
-        // Quick Look 닫기 + Finder 정리
-        let closeScript = NSAppleScript(source: """
-            tell application "System Events"
-                tell process "Finder"
-                    keystroke space
-                end tell
-            end tell
-            delay 0.3
-            tell application "Finder"
-                try
-                    close every window
-                end try
-            end tell
-        """)
-        closeScript?.executeAndReturnError(nil)
 
         if let data = try? Data(contentsOf: tempURL),
            let image = NSImage(data: data) {
@@ -273,40 +303,62 @@ final class NotionSketchCoordinator: NSObject {
         isCaptureFlowActive = false
 
         guard let app = targetApplication else {
-            // Notion 앱을 찾지 못하면 클립보드에만 복사
             writeImageToPasteboard(image)
             showAlert(title: "클립보드에 복사됨", message: "Notion에서 원본 이미지를 선택 후 Delete → Cmd+V로 교체하세요.")
             return
         }
 
+        // API 교체 시도 (캡션 보존)
+        if let ctx = capturedContext {
+            Task { @MainActor in
+                nsLog("API 교체 시도 — blockId: \(ctx.blockId)")
+                if let pngData = pngData(from: image) {
+                    let success = await NotionImageResolver.replaceBlockImage(context: ctx, pngData: pngData)
+                    if success {
+                        nsLog("API 교체 성공 — 캡션 보존됨")
+                        app.activate(options: [.activateIgnoringOtherApps])
+                        return
+                    }
+                    nsLog("API 교체 실패 — 키보드 폴백")
+                } else {
+                    nsLog("PNG 변환 실패 — 키보드 폴백")
+                }
+                fallbackKeyboardReplacement(image: image, app: app)
+            }
+            return
+        }
+
+        nsLog("capturedContext 없음 — 키보드 폴백")
+        fallbackKeyboardReplacement(image: image, app: app)
+    }
+
+    private func pngData(from image: NSImage) -> Data? {
+        guard let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff) else { return nil }
+        return rep.representation(using: .png, properties: [:])
+    }
+
+    private func fallbackKeyboardReplacement(image: NSImage, app: NSRunningApplication) {
         writeImageToPasteboard(image)
         app.activate(options: [.activateIgnoringOtherApps])
 
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 1_000_000_000)
 
-            // 이미지 블록 클릭하여 선택
             if let screenPos = capturedClickPosition {
                 clickAtPosition(screenPos)
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
 
-            // 이미지 선택 상태에서 위쪽 블록으로 이동
             sendKey(keyCode: 126) // Up arrow
             try? await Task.sleep(nanoseconds: 200_000_000)
-
-            // Enter로 이미지 바로 위에 새 빈 블록 생성
             sendKey(keyCode: 36) // Enter
             try? await Task.sleep(nanoseconds: 200_000_000)
-
-            // 새 빈 블록에 이미지 붙여넣기
             sendKey(keyCode: 9, modifiers: .maskCommand) // Cmd+V
             try? await Task.sleep(nanoseconds: 800_000_000)
-
-            // 아래의 원본 이미지로 이동하여 삭제
             sendKey(keyCode: 125) // Down arrow
             try? await Task.sleep(nanoseconds: 300_000_000)
-            sendKey(keyCode: 51) // Backspace (원본 삭제)
+            sendKey(keyCode: 51) // Backspace
         }
     }
 
@@ -353,7 +405,7 @@ final class NotionSketchCoordinator: NSObject {
             1. notionScatch를 실행해 둡니다.
             2. Notion 데스크톱 앱에서 바꾸고 싶은 이미지를 클릭해 선택합니다.
             3. Cmd+Shift+S를 누릅니다.
-            4. Preview에서 편집(iPad 주석 가능) 후 Cmd+S로 저장하면 원래 자리로 교체를 시도합니다.
+            4. Preview에서 편집 후 Cmd+S로 저장하면 원래 자리로 교체를 시도합니다.
             """
         )
     }
@@ -382,24 +434,35 @@ final class NotionSketchCoordinator: NSObject {
             }
         }
 
+        // API 교체용 컨텍스트 저장 (캡션 보존을 위해) — 이미지 획득 방식과 무관하게 항상 시도
+        let html = pasteboard.string(forType: .html)
+        let text = pasteboard.string(forType: .string)
+        self.capturedContext = NotionImageResolver.buildCaptureContext(clipboardHTML: html, clipboardText: text)
+
         // Try direct image from clipboard first
         if let image = await readImageFromPasteboard(pasteboard) {
             return image
         }
 
         // Resolve Notion attachment via local DB + signed URL
-        let html = pasteboard.string(forType: .html)
-        let text = pasteboard.string(forType: .string)
-        if let image = await NotionImageResolver.resolve(clipboardHTML: html, clipboardText: text) {
+        let (image, debugLog) = await NotionImageResolver.resolveWithDebug(clipboardHTML: html, clipboardText: text)
+        if let image {
             return image
         }
 
         let typeSummary = pasteboard.types?.map(\.rawValue).joined(separator: ", ") ?? "없음"
+        let htmlPreview = html.flatMap { String($0.prefix(300)) } ?? "(없음)"
         throw NSError(
             domain: "notionScatch",
             code: 1,
             userInfo: [
-                NSLocalizedDescriptionKey: "선택된 이미지 블록을 클립보드에서 찾지 못했습니다. Notion에서 이미지가 파란 선택 상태인지 확인해 주세요.\n\n클립보드 타입: \(typeSummary)"
+                NSLocalizedDescriptionKey: """
+                이미지를 가져오지 못했습니다.
+
+                [해석 단계]\n\(debugLog)
+
+                [HTML 일부]\n\(htmlPreview)
+                """
             ]
         )
     }
