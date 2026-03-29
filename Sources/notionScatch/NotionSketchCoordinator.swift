@@ -161,29 +161,28 @@ final class NotionSketchCoordinator: NSObject {
         let qlY = 80
 
         // osascript를 별도 프로세스로 실행 (앱 내 NSAppleScript는 자동화 권한 문제)
+        // NOTE: Space 토글이 안정적으로 작동하려면 checkForFileChanges의 cleanup에서
+        //   반드시 Space로 Quick Look을 먼저 닫은 뒤 close every window를 해야 한다.
+        //   이렇게 하면 Space 토글 상태가 항상 "닫힘"이므로 여기서 Space를 누르면
+        //   매번 QL이 열린다.
         let scriptText = """
         tell application "Finder"
             close every window
         end tell
-        delay 0.1
+        delay 0.2
         tell application "Finder"
             activate
             reveal (POSIX file "\(path)" as alias)
-            select (POSIX file "\(path)" as alias)
         end tell
-        delay 0.1
-        tell application "Finder"
-            try
-                set bounds of front window to {-2000, 2000, -1900, 2100}
-            end try
-        end tell
-        delay 0.3
+        delay 0.5
+        -- Space로 Quick Look 열기
+        -- cleanup에서 Space→close 순서로 닫으므로 토글 상태는 항상 "닫힘"
         tell application "System Events"
             tell process "Finder"
                 keystroke space
             end tell
         end tell
-        delay 0.5
+        delay 1.0
         tell application "System Events"
             tell process "Finder"
                 try
@@ -276,15 +275,52 @@ final class NotionSketchCoordinator: NSObject {
         nsLog("원본 수정일: \(String(describing: markupOriginalModDate)), 새 수정일: \(String(describing: newModDate))")
         stopMonitoringFile()
 
-        if let data = try? Data(contentsOf: tempURL),
-           let image = NSImage(data: data) {
-            replaceSelectedImageInNotion(with: image)
-        }
+        // 먼저 이미지 데이터 읽기 (폴더 삭제 전)
+        let fileExists = FileManager.default.fileExists(atPath: tempURL.path)
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: tempURL.path)[.size] as? Int) ?? 0
+        nsLog("파일 상태: exists=\(fileExists), size=\(fileSize), path=\(tempURL.path)")
+        let imageData = try? Data(contentsOf: tempURL)
+        nsLog("Data 읽기: \(imageData != nil ? "\(imageData!.count) bytes" : "nil")")
+        let image = imageData.flatMap { NSImage(data: $0) }
+        nsLog("NSImage 변환: \(image != nil ? "성공" : "실패")")
 
-        // 정리: temp 폴더 삭제
+        // Quick Look 닫기: Space 토글로 QL을 먼저 명시적으로 닫은 뒤 Finder 창을 닫는다.
+        // 이유: "close every window"는 Finder 창만 닫고 Quick Look의 내부 토글 상태를
+        //       리셋하지 않는다. QL이 "열림" 상태로 남으면 다음 Space가 "닫기"로 작동하여
+        //       2회차부터 QL이 열리지 않는 버그가 발생한다.
+        //       Space → close every window 순서로 실행하면 토글이 항상 동기화된다.
+        let cleanup = Process()
+        cleanup.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        cleanup.arguments = ["-e", """
+            tell application "Finder"
+                activate
+            end tell
+            delay 0.1
+            tell application "System Events"
+                tell process "Finder"
+                    keystroke space
+                end tell
+            end tell
+            delay 0.3
+            tell application "Finder"
+                close every window
+            end tell
+        """]
+        try? cleanup.run()
+        cleanup.waitUntilExit()
+
+        // temp 폴더 삭제
         try? FileManager.default.removeItem(at: tempURL.deletingLastPathComponent())
         markupTempURL = nil
         markupOriginalModDate = nil
+        markupMonitorStartDate = nil
+
+        if let image {
+            nsLog("이미지 로드 성공 (\(imageData?.count ?? 0) bytes), 교체 시작")
+            replaceSelectedImageInNotion(with: image)
+        } else {
+            nsLog("이미지 로드 실패: 파일 읽기 또는 NSImage 변환 오류")
+        }
     }
 
     private func cleanupMarkup() {
@@ -303,6 +339,7 @@ final class NotionSketchCoordinator: NSObject {
         isCaptureFlowActive = false
 
         guard let app = targetApplication else {
+            nsLog("targetApplication 없음 — 클립보드에만 복사")
             writeImageToPasteboard(image)
             showAlert(title: "클립보드에 복사됨", message: "Notion에서 원본 이미지를 선택 후 Delete → Cmd+V로 교체하세요.")
             return
@@ -421,6 +458,7 @@ final class NotionSketchCoordinator: NSObject {
     }
 
     private func captureSelectedImage() async throws -> NSImage {
+        nsLog("캡처 시작 — targetApp: \(targetApplication?.localizedName ?? "nil")")
         let pasteboard = NSPasteboard.general
         let initialChangeCount = pasteboard.changeCount
 
@@ -438,6 +476,7 @@ final class NotionSketchCoordinator: NSObject {
         let html = pasteboard.string(forType: .html)
         let text = pasteboard.string(forType: .string)
         self.capturedContext = NotionImageResolver.buildCaptureContext(clipboardHTML: html, clipboardText: text)
+        nsLog("capturedContext: \(capturedContext != nil ? "✅ blockId=\(capturedContext!.blockId)" : "❌ nil")")
 
         // Try direct image from clipboard first
         if let image = await readImageFromPasteboard(pasteboard) {

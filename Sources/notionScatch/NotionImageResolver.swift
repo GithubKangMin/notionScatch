@@ -259,9 +259,16 @@ enum NotionImageResolver {
 
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200,
+        nsLog("getSignedFileUrls 요청: source=\(source), blockId=\(blockId)")
+        guard let (data, response) = try? await URLSession.shared.data(for: request) else {
+            nsLog("getSignedFileUrls: 네트워크 오류")
+            return nil
+        }
+        let httpCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let respBody = String(data: data, encoding: .utf8) ?? ""
+        nsLog("getSignedFileUrls: HTTP \(httpCode) — \(respBody.prefix(300))")
+
+        guard httpCode == 200,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let signedUrls = json["signedUrls"] as? [String],
               let first = signedUrls.first else {
